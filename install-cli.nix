@@ -5,10 +5,14 @@
   extraSystemConfig ? "{}",
   writeEfiBootEntries ? false,
   rootMountPoint ? "/mnt",
+  hostSystem ? builtins.currentSystem,
 }:
 let
   originalSystem = (builtins.getFlake "${flake}").nixosConfigurations."${flakeAttr}";
   lib = originalSystem.pkgs.lib;
+
+  # Host pkgs for building host-native scripts (used in cross-VM mode)
+  hostPkgs = import originalSystem.pkgs.path { system = hostSystem; };
 
   deviceName =
     name:
@@ -57,6 +61,9 @@ let
       )
     ];
   };
+  # Build host-native mount script for cross-VM mode
+  # Uses host architecture binaries so it can run on the host after VM formatting
+  hostMountScript = (diskoSystem.config.disko.devices._scripts { pkgs = hostPkgs; }).mountScript;
 in
 {
   installToplevel = installSystem.config.system.build.toplevel;
@@ -64,4 +71,5 @@ in
     rootPaths = [ installSystem.config.system.build.toplevel ];
   };
   inherit (diskoSystem.config.system.build) formatScript mountScript diskoScript;
+  inherit hostMountScript;
 }

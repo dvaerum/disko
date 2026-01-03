@@ -22,6 +22,11 @@ Usage: $0 [OPTIONS]
   --system-config JSON        Merges the specified JSON object into the NixOS configuration.
   --mount-point PATH          Specify the mount point for the NixOS installation.
                               Default: /mnt/disko-install-root
+  --cross-vm                  Use a full system VM for disk formatting when the target architecture
+                              differs from the host. This is required for filesystems like ZFS that
+                              need kernel module support and can't work via binfmt/qemu-user emulation.
+  --vm-memory MB              Memory for the cross-VM in megabytes. Default: 2048.
+                              Increase for large ZFS operations.
 EOF
 }
 
@@ -49,6 +54,8 @@ extraSystemConfig="{}"
 diskoAttr=diskoScript
 writeEfiBootEntries=false
 mountPoint=/mnt/disko-install-root
+crossVm=false
+vmMemoryMB=2048
 declare -A diskMappings
 declare -A extraFiles
 
@@ -146,6 +153,17 @@ parseArgs() {
       mountPoint=$2
       shift
       ;;
+    --cross-vm)
+      crossVm=true
+      ;;
+    --vm-memory)
+      if [[ $# -lt 2 ]]; then
+        echo "Option $1 requires an argument (memory in MB)" >&2
+        exit 1
+      fi
+      vmMemoryMB=$2
+      shift
+      ;;
     *)
       echo "Unknown option: $1" >&2
       showUsage
@@ -161,6 +179,27 @@ cleanupMountPoint() {
     umount -R "${mountPoint}"
   fi
   rmdir "${mountPoint}"
+}
+
+copyExtraFiles() {
+  for source in "${!extraFiles[@]}"; do
+    destination=${extraFiles[$source]}
+    mkdir -p "$mountPoint/$(dirname "$destination")"
+    cp -ar "$source" "$mountPoint/$destination"
+  done
+}
+
+copyStoreAndInstall() {
+  if [[ ! -f "${mountPoint}/nix/var/nix/db/db.sqlite" ]]; then
+    echo "Copying store paths" >&2
+    mkdir -p "${mountPoint}/nix/store"
+    xargs xcp --recursive --target-directory "${mountPoint}/nix/store" < "${closure_info}/store-paths"
+    echo "Loading nix database" >&2
+    mkdir -p "${mountPoint}/nix/var/nix"
+    NIX_STATE_DIR=${mountPoint}/nix/var/nix nix-store --load-db < "${closure_info}/registration"
+  fi
+
+  nixos-install --no-channel-copy --no-root-password --system "$nixos_system" --root "$mountPoint"
 }
 
 nixBuild() {
@@ -232,64 +271,199 @@ main() {
      trap cleanupMountPoint EXIT
   fi
 
-  if ! outputs=$(nixBuild "${libexec_dir}"/install-cli.nix \
-    "${nix_args[@]}" \
-    --no-out-link \
-    --impure \
-    --argstr flake "$flake" \
-    --argstr flakeAttr "$flakeAttr" \
-    --argstr rootMountPoint "$mountPoint" \
-    --arg writeEfiBootEntries "$writeEfiBootEntries" \
-    --arg diskMappings "$(serialiaseArrayToNix diskMappings)" \
-    --argstr extraSystemConfig "$extraSystemConfig" \
-    -A installToplevel \
-    -A closureInfo \
-    -A "$diskoAttr"); then
-    echo "Failed to build NixOS configuration" >&2
-    exit 1
+  # For cross-VM mode, we need formatScript (for VM) and host scripts (for host)
+  if [[ "$crossVm" == "true" ]]; then
+    if ! outputs=$(nixBuild "${libexec_dir}"/install-cli.nix \
+      "${nix_args[@]}" \
+      --no-out-link \
+      --impure \
+      --argstr flake "$flake" \
+      --argstr flakeAttr "$flakeAttr" \
+      --argstr rootMountPoint "$mountPoint" \
+      --arg writeEfiBootEntries "$writeEfiBootEntries" \
+      --arg diskMappings "$(serialiaseArrayToNix diskMappings)" \
+      --argstr extraSystemConfig "$extraSystemConfig" \
+      -A installToplevel \
+      -A closureInfo \
+      -A formatScript \
+      -A hostMountScript \
+      -A "$diskoAttr"); then
+      echo "Failed to build NixOS configuration" >&2
+      exit 1
+    fi
+
+    IFS=$'\n' mapfile -t artifacts <<<"$outputs"
+
+    if [[ ${#artifacts[@]} -ne 5 ]]; then
+      echo "Expected 5 build outputs for cross-VM mode, got ${#artifacts[@]}" >&2
+      echo "Outputs received:" >&2
+      printf '%s\n' "${artifacts[@]}" >&2
+      exit 1
+    fi
+
+    nixos_system=${artifacts[0]}
+    closure_info=${artifacts[1]}
+    format_script=${artifacts[2]}
+    host_mount_script=${artifacts[3]}
+    disko_script=${artifacts[4]}
+  else
+    if ! outputs=$(nixBuild "${libexec_dir}"/install-cli.nix \
+      "${nix_args[@]}" \
+      --no-out-link \
+      --impure \
+      --argstr flake "$flake" \
+      --argstr flakeAttr "$flakeAttr" \
+      --argstr rootMountPoint "$mountPoint" \
+      --arg writeEfiBootEntries "$writeEfiBootEntries" \
+      --arg diskMappings "$(serialiaseArrayToNix diskMappings)" \
+      --argstr extraSystemConfig "$extraSystemConfig" \
+      -A installToplevel \
+      -A closureInfo \
+      -A "$diskoAttr"); then
+      echo "Failed to build NixOS configuration" >&2
+      exit 1
+    fi
+
+    IFS=$'\n' mapfile -t artifacts <<<"$outputs"
+
+    if [[ ${#artifacts[@]} -ne 3 ]]; then
+      echo "Expected 3 build outputs, got ${#artifacts[@]}" >&2
+      echo "Outputs received:" >&2
+      printf '%s\n' "${artifacts[@]}" >&2
+      exit 1
+    fi
+
+    nixos_system=${artifacts[0]}
+    closure_info=${artifacts[1]}
+    disko_script=${artifacts[2]}
   fi
-
-  IFS=$'\n' mapfile -t artifacts <<<"$outputs"
-
-  if [[ ${#artifacts[@]} -ne 3 ]]; then
-    echo "Expected 3 build outputs, got ${#artifacts[@]}" >&2
-    echo "Outputs received:" >&2
-    printf '%s\n' "${artifacts[@]}" >&2
-    exit 1
-  fi
-
-  nixos_system=${artifacts[0]}
-  closure_info=${artifacts[1]}
-  disko_script=${artifacts[2]}
 
   if [[ -n ${dry_run-} ]]; then
     echo "Would run: $disko_script"
     echo "Would run: nixos-install --system '$nixos_system' --root '$mountPoint'"
+    if [[ "$crossVm" == "true" ]]; then
+      echo "(Using cross-VM mode for disk formatting)"
+    fi
     exit 0
   fi
 
-  # We don't want swap as can break your running system in weird ways if you eject the disk
-  # Hopefully disko-install has enough RAM to run without swap, otherwise we can make this configurable in future.
-  DISKO_SKIP_SWAP=1 "$disko_script"
+  if [[ "$crossVm" == "true" ]]; then
+    # Cross-VM mode: run disko format script inside a full system VM
+    # This is required for filesystems like ZFS that need kernel module support
 
-  for source in "${!extraFiles[@]}"; do
-    destination=${extraFiles[$source]}
-    mkdir -p "$mountPoint/$(dirname "$destination")"
-    cp -ar "$source" "$mountPoint/$destination"
-  done
+    # For --mode mount, we don't need the VM - just use the host mount script directly
+    if [[ "$diskoAttr" == "mountScript" ]]; then
+      echo "Mount mode with --cross-vm: using host-native mount script" >&2
+      "$host_mount_script"
+      copyExtraFiles
+      copyStoreAndInstall
+    else
+      echo "Using cross-VM mode for disk formatting" >&2
 
-  # nix copy uses up a lot of memory and we work around issues with incorrect checksums in our store
-  # that can be caused by using closureInfo in combination with multiple builders and non-deterministic builds.
-  # Therefore if we have a blank store, we copy the store paths and registration from the closureInfo.
-  if [[ ! -f "${mountPoint}/nix/var/nix/db/db.sqlite" ]]; then
-    echo "Copying store paths" >&2
-    mkdir -p "${mountPoint}/nix/store"
-    xargs xcp --recursive --target-directory "${mountPoint}/nix/store"  < "${closure_info}/store-paths"
-    echo "Loading nix database" >&2
-    NIX_STATE_DIR=${mountPoint}/nix/var/nix nix-store --load-db < "${closure_info}/registration"
+      targetSystem=$(nix eval "${nix_args[@]}" --raw "${flake}#nixosConfigurations.${flakeAttr}.pkgs.stdenv.hostPlatform.system" 2>/dev/null || echo "")
+      hostSystem=$(nix eval "${nix_args[@]}" --raw --expr "builtins.currentSystem" 2>/dev/null || echo "x86_64-linux")
+
+      echo "Host system: $hostSystem" >&2
+      echo "Target system: $targetSystem" >&2
+
+      if [[ "$targetSystem" == "$hostSystem" ]]; then
+        echo "Warning: --cross-vm specified but target ($targetSystem) matches host, falling back to direct execution" >&2
+        DISKO_SKIP_SWAP=1 "$disko_script"
+      else
+        # Check binfmt configuration for cross-architecture support
+        # nixos-install uses chroot which requires binfmt with the F (fixBinary) flag
+        # The binfmt registration names match the NixOS system names exactly
+        # Only check for architectures that cross-VM actually supports
+        binfmtArch=""
+        case "$targetSystem" in
+          aarch64-linux) binfmtArch="aarch64-linux" ;;
+          armv7l-linux) binfmtArch="armv7l-linux" ;;
+          i686-linux) binfmtArch="i686-linux" ;;
+          x86_64-linux) binfmtArch="x86_64-linux" ;;
+          riscv64-linux) binfmtArch="riscv64-linux" ;;
+          *)
+            echo "Unsupported target system for cross-VM: $targetSystem" >&2
+            echo "Supported: aarch64-linux, x86_64-linux, armv7l-linux, riscv64-linux, i686-linux" >&2
+            exit 1
+            ;;
+        esac
+
+        if [[ -n "$binfmtArch" ]]; then
+          binfmtFile="/proc/sys/fs/binfmt_misc/${binfmtArch}"
+          if [[ ! -f "$binfmtFile" ]]; then
+            echo "binfmt emulation for $targetSystem is not configured" >&2
+            echo "" >&2
+            echo "Cross-VM mode requires binfmt to run cross-architecture binaries" >&2
+            echo "Add this to your NixOS configuration:" >&2
+            echo "" >&2
+            echo "  boot.binfmt.emulatedSystems = [ \"$targetSystem\" ];" >&2
+            echo "" >&2
+            echo "Then run: sudo nixos-rebuild switch" >&2
+            exit 1
+          fi
+
+          binfmtFlags=$(grep "^flags:" "$binfmtFile" 2>/dev/null | awk '{print $2}')
+          if [[ "$binfmtFlags" != *"F"* ]]; then
+            echo "binfmt for $targetSystem is missing the 'F' (fixBinary) flag" >&2
+            echo "" >&2
+            echo "Current flags: $binfmtFlags" >&2
+            echo "Required flag: F (allows binfmt to work inside chroot)" >&2
+            echo "" >&2
+            echo "The 'F' flag is required for nixos-install to work in a chroot" >&2
+            echo "Add this to your NixOS configuration:" >&2
+            echo "" >&2
+            echo "  boot.binfmt.emulatedSystems = [ \"$targetSystem\" ];" >&2
+            echo "  boot.binfmt.preferStaticEmulators = true;" >&2
+            echo "" >&2
+            echo "Then run: sudo nixos-rebuild switch" >&2
+            exit 1
+          fi
+
+          echo "binfmt for $targetSystem is properly configured (flags: $binfmtFlags)" >&2
+        fi
+
+        echo "Building cross-VM installer" >&2
+
+        nixpkgsPath=$(nix eval "${nix_args[@]}" --raw "${flake}#nixosConfigurations.${flakeAttr}.pkgs.path" 2>/dev/null || echo "")
+
+        if [[ -z "$nixpkgsPath" ]]; then
+          echo "Could not determine nixpkgs path from the flake" >&2
+          echo "" >&2
+          echo "The flake must expose nixpkgs through nixosConfigurations.${flakeAttr}.pkgs.path" >&2
+          echo "This is typically available when using standard NixOS flake structures" >&2
+          exit 1
+        fi
+
+        # Use formatScript for VM (format only, no mount)
+        # The host will handle mounting after VM completes
+        crossVmScript=$(nixBuild "${libexec_dir}"/lib/cross-vm-install.nix \
+          --no-out-link \
+          --argstr targetSystem "$targetSystem" \
+          --arg hostPkgs "import $nixpkgsPath { system = \"$hostSystem\"; }" \
+          --argstr formatScript "$format_script" \
+          --arg diskMappings "$(serialiaseArrayToNix diskMappings)" \
+          --arg vmMemoryMB "$vmMemoryMB" \
+          -I nixpkgs="$nixpkgsPath")
+
+        echo "Running cross-VM installer" >&2
+        "$crossVmScript"
+
+        # After cross-VM formatting, mount filesystems using the host-native mount script
+        # This script was built with host architecture binaries so it runs natively
+        echo "Cross-VM formatting complete, mounting filesystems on host" >&2
+        "$host_mount_script"
+        copyExtraFiles
+        copyStoreAndInstall
+      fi
+    fi
+  else
+    # Standard mode: run disko script directly on the host
+    # We don't want swap as can break your running system in weird ways if you eject the disk
+    # Hopefully disko-install has enough RAM to run without swap, otherwise we can make this configurable in future.
+    DISKO_SKIP_SWAP=1 "$disko_script"
+    copyExtraFiles
+    copyStoreAndInstall
   fi
-
-  nixos-install --no-channel-copy --no-root-password --system "$nixos_system" --root "$mountPoint"
 }
 
 if main "$@"; then
